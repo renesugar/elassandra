@@ -854,7 +854,7 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                 }
             }
             
-            public void deleteByQuery(RangeTombstone tombstone) {
+            public void deleteByQuery(final Object pkCols[], RangeTombstone tombstone) {
                 IndexShard shard = shard();
                 if (shard != null) {
                     Slice slice = tombstone.deletedSlice();
@@ -864,14 +864,32 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                     DocumentMapper docMapper = indexService.mapperService().documentMapper(typeName);
                     BooleanQuery.Builder builder = new BooleanQuery.Builder();
                     
+                    int partitionKeyLen = baseCfs.metadata.partitionKeyColumns().size();
+                    
                     // build the primary key part of the delete by query
                     int i = 0;
                     for(ColumnDefinition cd : baseCfs.metadata.primaryKeyColumns()) {
-                        if (i >= start.size())
+                        if (i >= (partitionKeyLen + Math.max(start.size(), end.size())))
                             break;
                         if (indexedPkColumns[i]) {
                             FieldMapper mapper = docMapper.mappers().smartNameFieldMapper(cd.name.toString());
-                            builder.add( buildQuery( cd, mapper, start.get(i), end.get(i), start.isInclusive(), end.isInclusive()), Occur.FILTER);
+                            Query q;
+                            if (i < partitionKeyLen) {
+                                q = buildQuery( cd, mapper, pkCols[i], pkCols[i], true, true);
+                            } else {
+                                ByteBuffer startByteBuffer = null, endByteBuffer = null;
+                                boolean startIsInclusive = true, endIsInclusive = true;
+                                if (i - partitionKeyLen < start.size()) {
+                                    startByteBuffer = start.get(i - partitionKeyLen);
+                                    startIsInclusive = start.isInclusive();
+                                }
+                                if (i - partitionKeyLen < end.size()) {
+                                    endByteBuffer = end.get(i - partitionKeyLen);
+                                    endIsInclusive = end.isInclusive();
+                                }
+                                q = buildQuery( cd, mapper, startByteBuffer, endByteBuffer, startIsInclusive, endIsInclusive);
+                            }
+                            builder.add(q , Occur.FILTER);
                         }
                         i++;
                     }
@@ -899,8 +917,12 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
              */
             @SuppressForbidden(reason="unchecked")
             private Query buildQuery(ColumnDefinition cd, FieldMapper mapper, ByteBuffer lower, ByteBuffer upper, boolean includeLower, boolean includeUpper) {
-                Object start = cd.type.compose(lower);
-                Object end = cd.type.compose(upper);
+                Object start = lower == null ? null : cd.type.compose(lower);
+                Object end = upper == null ? null : cd.type.compose(upper);
+                return buildQuery(cd, mapper, start, end, includeLower, includeUpper);
+            }
+            
+            private Query buildQuery(ColumnDefinition cd, FieldMapper mapper, Object start, Object end, boolean includeLower, boolean includeUpper) {
                 Query query = null;
                 if (mapper != null) {
                     CQL3Type cql3Type = cd.type.asCQL3Type();
@@ -909,29 +931,44 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                         case ASCII:
                         case TEXT:
                         case VARCHAR:
-                            if (start.equals(end)) {
+                            if (start != null && end != null && ((String)start).equals((String)end)) {
                                 query = new TermQuery(new Term(cd.name.toString(),  BytesRefs.toBytesRef(start)));
                             } else {
-                                query = new TermRangeQuery(cd.name.toString(),  BytesRefs.toBytesRef(start),  BytesRefs.toBytesRef(end),includeLower, includeUpper);
+                                query = new TermRangeQuery(cd.name.toString(),  BytesRefs.toBytesRef(start), BytesRefs.toBytesRef(end), includeLower, includeUpper);
                             }
                             break;
                         case INT:
                         case SMALLINT:
                         case TINYINT:
-                            query = IntPoint.newRangeQuery(cd.name.toString(), (Integer) start, (Integer) end);
+                            if (start != null && end != null && ((Integer)start).compareTo((Integer)end) == 0) {
+                                query = IntPoint.newExactQuery(cd.name.toString(), (Integer) start);
+                            } else {
+                                query = IntPoint.newRangeQuery(cd.name.toString(), (Integer) start, (Integer) end);
+                            }
                             break;
                         case INET:
                         case TIMESTAMP:
                         case BIGINT:
-                            query = LongPoint.newRangeQuery(cd.name.toString(), (Long) start, (Long) start);
+                            if (start != null && end != null && ((Long)start).compareTo((Long)end) == 0) {
+                                query = NumberFieldMapper.NumberType.LONG.termQuery(cd.name.toString(), (Long) start);
+                            } else {
+                                query = NumberFieldMapper.NumberType.LONG.rangeQuery(cd.name.toString(), (Long) start, (Long) end, includeLower, includeUpper, mapper.fieldType().hasDocValues());
+                            }
                             break;
                         case DOUBLE:
-                            query = DoublePoint.newRangeQuery(cd.name.toString(), (Double) start, (Double) start);
+                            if (start != null && end != null && ((Double)start).compareTo((Double)end) == 0) {
+                                query = DoublePoint.newExactQuery(cd.name.toString(), (Double) start);
+                            } else {
+                                query = DoublePoint.newRangeQuery(cd.name.toString(), (Double) start, (Double) end);
+                            }
                             break;
                         case FLOAT:
-                            query = FloatPoint.newRangeQuery(cd.name.toString(), (Float) start, (Float) start);
+                            if (start != null && end != null && ((Float)start).compareTo((Float)end) == 0) {
+                                query = FloatPoint.newExactQuery(cd.name.toString(), (Float) start);
+                            } else {
+                                query = FloatPoint.newRangeQuery(cd.name.toString(), (Float) start, (Float) end);
+                            }
                             break;
-                            
                         case DECIMAL:
                         case TIMEUUID:
                         case UUID:
@@ -1420,15 +1457,15 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
              */
             @Override
             public void rangeTombstone(RangeTombstone tombstone) {
-                logger.trace("range tombestone row {}: {}", this.transactionType, tombstone);
+                logger.trace("range tombestone row {}: {}", this.transactionType, tombstone.deletedSlice());
                 try {
                     BitSet targets = targetIndices(pkCols);
                     if (targets == null) {
                         for(ImmutableMappingInfo.ImmutableIndexInfo indexInfo : indices)
-                            indexInfo.deleteByQuery(tombstone);
+                            indexInfo.deleteByQuery(pkCols, tombstone);
                     } else {
                         for(int i = targets.nextSetBit(0); i >= 0 && i < indices.length; i = targets.nextSetBit(i+1))
-                            indices[i].deleteByQuery(tombstone);
+                            indices[i].deleteByQuery(pkCols, tombstone);
                     }
                 } catch(Throwable t) {
                     logger.error("Unexpected error", t);
