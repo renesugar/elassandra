@@ -1034,7 +1034,7 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
         final ObjectIntHashMap<String> fieldsToIdx;
         final BitSet fieldsToRead;
         final BitSet staticColumns;
-        final boolean hasIndexedMultiCell;
+        final boolean hasNonFrozenIndexedMultiCell;
         final boolean indexSomeStaticColumnsOnWideRow; 
         final boolean[] indexedPkColumns;   // bit mask of indexed PK columns.
         final long metadataVersion;
@@ -1054,7 +1054,7 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                 this.fieldsToIdx = null;
                 this.fieldsToRead = null;
                 this.staticColumns = null;
-                this.hasIndexedMultiCell = false;
+                this.hasNonFrozenIndexedMultiCell = false;
                 this.indexSomeStaticColumnsOnWideRow = false;
                 this.indexedPkColumns = null;
                 this.partitionFunctions = null;
@@ -1152,7 +1152,7 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                 this.fieldsToIdx = null;
                 this.fieldsToRead = null;
                 this.staticColumns = null;
-                this.hasIndexedMultiCell = false;
+                this.hasNonFrozenIndexedMultiCell = false;
                 this.indexSomeStaticColumnsOnWideRow = false;
                 this.indexedPkColumns = null;
                 this.partitionFunctions = null;
@@ -1198,21 +1198,21 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
             
             this.fieldsToRead = new BitSet(fields.length);
             this.staticColumns = (baseCfs.metadata.hasStaticColumns()) ? new BitSet(fields.length) : null;
-            boolean hasMultiCellColumn = false;
+            boolean hasNonFrozenMultiCellColumn = false;
             for(int i=0; i < fields.length; i++) {
                 ColumnIdentifier colId = new ColumnIdentifier(fields[i], true);
                 ColumnDefinition colDef = baseCfs.metadata.getColumnDefinition(colId);
                 if (colDef != null) {
                     // colDef may be null when mapping an object with no sub-field (and no underlying column, see #144)
                     this.fieldsToRead.set(i, fieldsMap.get(fields[i]) && !colDef.isPrimaryKeyColumn());
-                    hasMultiCellColumn |= colDef.type.isMultiCell();
+                    hasNonFrozenMultiCellColumn |= (colDef.type.isMultiCell() && !colDef.type.isFrozenCollection());
                     if (staticColumns != null)
                         this.staticColumns.set(i, colDef.isStatic());
                 } else {
                     this.fieldsToRead.set(i, false);
                 }
             }
-            this.hasIndexedMultiCell = hasMultiCellColumn;
+            this.hasNonFrozenIndexedMultiCell = hasNonFrozenMultiCellColumn;
             
             if (partFuncs != null && partFuncs.size() > 0) {
                 for(ImmutablePartitionFunction func : partFuncs.values()) {
@@ -1327,7 +1327,7 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                  * Check for missing fields
                  * @return true if the rowcument needs some fields.
                  */
-                public boolean hasMissingFields() {
+                public boolean needsReadBeforeWrite() {
                     // add static fields before checking for missing fields
                     try {
                         if (inStaticRow != null)
@@ -1337,7 +1337,7 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                     } catch (IOException e) {
                         logger.error("Unexpected error", e);
                     }
-                    return super.hasMissingFields();
+                    return super.needsReadBeforeWrite();
                 }
             }
             
@@ -1381,19 +1381,20 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                 case COMPACTION:
                 case UPDATE:
                     if (!clusterings.isEmpty()) {
-                        boolean hasMissingFields = false;
+                        boolean needsReadBeforeWrite = false;
                         for(WideRowcument rowcument : rowcuments.values()) {
-                            if (rowcument.hasLiveData && rowcument.hasMissingFields()) {
-                                hasMissingFields = true;
+                            if (rowcument.needsReadBeforeWrite()) {
+                                needsReadBeforeWrite = true;
                                 break;
                             }
                         }
-                        if (hasMissingFields) {
+                        if (needsReadBeforeWrite) {
                             if (logger.isTraceEnabled())
                                 logger.trace("indexer={} read partition for clusterings={}", this.hashCode(), clusterings);
                             SinglePartitionReadCommand command = SinglePartitionReadCommand.create(baseCfs.metadata, nowInSec, key, clusterings);
                             RowIterator rowIt = read(command);
-                            this.inStaticRow = rowIt.staticRow();
+                            if (!rowIt.staticRow().isEmpty())
+                                this.inStaticRow = rowIt.staticRow();
                             for(; rowIt.hasNext(); ) {
                                 Row row = rowIt.next();
                                 try {
@@ -1509,7 +1510,7 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                         break;
                     case COMPACTION: // remove expired row or reindex a doc when a column has expired, happen only when index_on_compaction=true for at least one elasticsearch index.
                     case UPDATE:
-                        if (rowcument.hasMissingFields()) {
+                        if (rowcument.needsReadBeforeWrite()) {
                             SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(baseCfs.metadata, nowInSec, key);
                             RowIterator rowIt = read(command);
                             if (rowIt.hasNext())
@@ -1825,9 +1826,14 @@ public class ElasticSecondaryIndex implements Index, ClusterStateListener {
                  * Check for missing fields
                  * @return true if the rowcument needs some fields.
                  */
-                public boolean hasMissingFields() {
-                    if (hasIndexedMultiCell)
+                public boolean needsReadBeforeWrite() {
+                    // non-frozen collection require a read before write
+                    if (hasNonFrozenIndexedMultiCell)
                         return true;
+                    
+                    // if row as no live data, it's a delete operation
+                    if (!hasLiveData)
+                        return false;
                     
                     // add missing or collection columns that should be read before indexing the document.
                     // read missing static or regular columns

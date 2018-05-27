@@ -76,6 +76,11 @@ These parameters control the cassandra mapping.
 
 For more information about cassandra collection types and compound primary key, see `CQL Collections <https://docs.datastax.com/en/cql/3.1/cql/cql_using/use_collections_c.html>`_ and `Compound keys <https://docs.datastax.com/en/cql/3.1/cql/ddl/ddl_compound_keys_c.html>`_.
 
+.. TIP::
+   
+   On each update, Elassandra read for missing fields in order to build a full Elasticsearch document. If some fields are backed by Cassandra collections (map, set or list), Elassandra
+   force a read before index even if all fields are provided in the Cassandra upsert operation. For this reason, when you don't need for multi-valued fields, use fields backed by
+   native cassandra types rather than the default list to avoid a read-before-index when inserting a row containing all its mandatory elasticsearch fields.
 
 Bidirectionnal mapping
 ----------------------
